@@ -9,113 +9,102 @@ import plotly.graph_objects as go
 st.set_page_config(page_title="BTC Market Dashboard", layout="wide")
 
 # -----------------------------
-# Safer requests + multi-source fallback
+# Safe requests (NO raise_for_status) + retries
 # -----------------------------
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; BTC-Dashboard/1.0; +https://streamlit.app)",
     "Accept": "application/json",
 }
 
-def safe_get(url, params=None, timeout=12, retries=3):
+def safe_get(url, params=None, timeout=15, retries=3):
     """
-    Safer requests:
-    - add headers (some providers block empty UA)
-    - retry on 429/5xx with exponential backoff
-    - return None instead of raising and crashing the app
+    - Never raise_for_status (avoid crashing)
+    - Retry on 429/5xx with backoff
+    - Return (json, status_code)
     """
+    last_status = None
     for i in range(retries):
         try:
             r = requests.get(url, params=params, timeout=timeout, headers=DEFAULT_HEADERS)
+            last_status = r.status_code
             if r.status_code == 200:
-                return r.json()
+                return r.json(), 200
 
-            # Rate limit or transient server errors: retry with backoff
+            # rate limit / transient errors
             if r.status_code in (429, 500, 502, 503, 504):
                 time.sleep((2 ** i) + random.random())
                 continue
 
-            # Other errors: don't crash
-            return None
+            return None, r.status_code
         except Exception:
             time.sleep((2 ** i) + random.random())
             continue
-    return None
+    return None, last_status or -1
 
+# -----------------------------
+# Data sources
+# -----------------------------
 @st.cache_data(ttl=30)
-def get_btc_price_usd():
+def get_btc_spot_usd():
     """
-    Return (spot_price, source_name)
+    Prefer Coinbase/Binance to avoid CoinGecko 429 on Streamlit Cloud.
+    Return (price, source)
     """
-    # 1) CoinGecko
-    data = safe_get(
-        "https://api.coingecko.com/api/v3/simple/price",
-        params={"ids": "bitcoin", "vs_currencies": "usd"},
-    )
-    if data and "bitcoin" in data and "usd" in data["bitcoin"]:
-        return float(data["bitcoin"]["usd"]), "CoinGecko"
-
-    # 2) Coinbase
-    data = safe_get("https://api.coinbase.com/v2/prices/BTC-USD/spot")
+    # 1) Coinbase
+    data, code = safe_get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=12, retries=3)
     if data and "data" in data and "amount" in data["data"]:
         return float(data["data"]["amount"]), "Coinbase"
 
-    # 3) Binance (USDT proxy)
-    data = safe_get("https://api.binance.com/api/v3/ticker/price", params={"symbol": "BTCUSDT"})
+    # 2) Binance (USDT proxy)
+    data, code = safe_get("https://api.binance.com/api/v3/ticker/price", params={"symbol": "BTCUSDT"}, timeout=12, retries=3)
     if data and "price" in data:
         return float(data["price"]), "Binance"
 
-    raise RuntimeError("现价数据源全部失败（CoinGecko/Coinbase/Binance）。请稍后重试。")
+    # 3) CryptoCompare price
+    data, code = safe_get("https://min-api.cryptocompare.com/data/price", params={"fsym": "BTC", "tsyms": "USD"}, timeout=12, retries=3)
+    if data and "USD" in data:
+        return float(data["USD"]), "CryptoCompare"
 
-@st.cache_data(ttl=300)
-def get_btc_history(days: int = 365):
-    """
-    Prefer CoinGecko; fallback to CryptoCompare histoday.
-    Return DataFrame with columns: date (datetime), price (float)
-    """
-    # 1) CoinGecko
-    data = safe_get(
-        "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
-        params={"vs_currency": "usd", "days": days, "interval": "daily"},
-        timeout=20,
-        retries=3,
-    )
-    if data and "prices" in data:
-        df = pd.DataFrame(data["prices"], columns=["ts_ms", "price"])
-        df["date"] = pd.to_datetime(df["ts_ms"], unit="ms", utc=True).dt.date
-        df = df.groupby("date", as_index=False)["price"].last()
-        df["date"] = pd.to_datetime(df["date"])
-        return df.sort_values("date").reset_index(drop=True)
+    raise RuntimeError("现价数据源全部失败（Coinbase/Binance/CryptoCompare）。")
 
-    # 2) CryptoCompare fallback (daily candles)
-    # limit is number of points minus 1; keep within reasonable bounds
+@st.cache_data(ttl=600)
+def get_btc_history_daily(days: int = 365):
+    """
+    Use CryptoCompare histoday as PRIMARY to avoid CoinGecko 429.
+    Return DataFrame: date, price (UTC)
+    """
+    # CryptoCompare histoday: max ~2000 points without key
     limit = int(min(max(days, 30), 2000)) - 1
-    cc = safe_get(
+    data, code = safe_get(
         "https://min-api.cryptocompare.com/data/v2/histoday",
         params={"fsym": "BTC", "tsym": "USD", "limit": limit},
         timeout=20,
         retries=3,
     )
-    if cc and cc.get("Response") == "Success":
-        rows = cc["Data"]["Data"]
+    if data and data.get("Response") == "Success":
+        rows = data["Data"]["Data"]
         df = pd.DataFrame(rows)
         df["date"] = pd.to_datetime(df["time"], unit="s", utc=True)
         df["price"] = df["close"].astype(float)
-        return df[["date", "price"]].sort_values("date").reset_index(drop=True)
+        df = df[["date", "price"]].sort_values("date").reset_index(drop=True)
+        return df
 
-    raise RuntimeError("历史价格数据源失败（CoinGecko/CryptoCompare）。请稍后重试。")
+    raise RuntimeError(f"历史价格失败（CryptoCompare）。HTTP={code}")
 
-@st.cache_data(ttl=300)
-def get_fear_greed(limit=120):
-    data = safe_get("https://api.alternative.me/fng/", params={"limit": limit, "format": "json"}, timeout=20, retries=3)
+@st.cache_data(ttl=600)
+def get_fear_greed(limit=200):
+    data, code = safe_get("https://api.alternative.me/fng/", params={"limit": limit, "format": "json"}, timeout=20, retries=3)
     if not data or "data" not in data:
-        raise RuntimeError("恐惧贪婪指数数据源失败（alternative.me）。请稍后重试。")
+        raise RuntimeError(f"恐惧贪婪指数失败（alternative.me）。HTTP={code}")
 
-    rows = data["data"]
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(data["data"])
     df["value"] = df["value"].astype(float)
     df["date"] = pd.to_datetime(df["timestamp"].astype(int), unit="s", utc=True)
     return df.sort_values("date").reset_index(drop=True)[["date", "value", "value_classification"]]
 
+# -----------------------------
+# Indicators
+# -----------------------------
 def realized_vol(df_price: pd.DataFrame, window_days: int = 30):
     px = df_price["price"].astype(float).values
     if len(px) < window_days + 2:
@@ -160,9 +149,9 @@ def small_card(title, value, footnote):
     )
 
 # -----------------------------
-# UI Controls
+# UI
 # -----------------------------
-st.title("BTC 市场分析 Dashboard（免本地部署版）")
+st.title("BTC 市场分析 Dashboard（免本地部署版 / 抗限流）")
 
 _, right = st.columns([3, 1])
 with right:
@@ -181,14 +170,14 @@ days_map = {"7d": 7, "30d": 30, "90d": 90, "180d": 180, "1Y": 365}
 days = days_map[tf]
 
 # -----------------------------
-# Data Load (with error display)
+# Load data
 # -----------------------------
 try:
-    spot, spot_src = get_btc_price_usd()
-    hist = get_btc_history(days=max(365 * 2, days))
+    spot, spot_src = get_btc_spot_usd()
+    hist = get_btc_history_daily(days=max(365 * 2, days))
     hist_slice = hist[hist["date"] >= (hist["date"].max() - pd.Timedelta(days=days))].reset_index(drop=True)
 
-    fng = get_fear_greed(limit=max(120, days + 10))
+    fng = get_fear_greed(limit=max(200, days + 20))
     fng_slice = fng[fng["date"] >= (fng["date"].max() - pd.Timedelta(days=days))].reset_index(drop=True)
 
     rv30 = realized_vol(hist, 30)
@@ -199,18 +188,18 @@ except Exception as e:
     st.stop()
 
 # -----------------------------
-# KPI Calculations
+# KPIs
 # -----------------------------
 rv90_last = float(rv90.dropna().iloc[-1]["rv90"]) if rv90["rv90"].notna().any() else np.nan
 rv90_pct = percentile_rank(rv90["rv90"], rv90_last)
+
+rv30_last = float(rv30.dropna().iloc[-1]["rv30"]) if rv30["rv30"].notna().any() else np.nan
 
 fng_last = float(fng_slice.iloc[-1]["value"]) if len(fng_slice) else np.nan
 fng_class = fng_slice.iloc[-1]["value_classification"] if len(fng_slice) else "N/A"
 fng_pct = percentile_rank(fng["value"], fng_last)
 
-rv30_last = float(rv30.dropna().iloc[-1]["rv30"]) if rv30["rv30"].notna().any() else np.nan
-
-# simple score 0-100
+# score
 score = 50.0
 if not np.isnan(rv90_pct):
     score += (50.0 - rv90_pct) * 0.4
@@ -298,4 +287,4 @@ with right2:
     fig.update_layout(height=360, margin=dict(l=10, r=10, t=30, b=10), yaxis=dict(title="Price USD"))
     st.plotly_chart(fig, use_container_width=True)
 
-st.caption("说明：为保证稳定运行，现价使用 CoinGecko→Coinbase→Binance 兜底；历史价格使用 CoinGecko→CryptoCompare 兜底。")
+st.caption("说明：为避免 Streamlit Cloud 被 CoinGecko 429 限流，本版本历史数据采用 CryptoCompare；现价优先 Coinbase→Binance→CryptoCompare。")
