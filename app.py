@@ -9,7 +9,7 @@ import plotly.graph_objects as go
 st.set_page_config(page_title="BTC Market Dashboard", layout="wide")
 
 # =========================================================
-# Compatibility helpers (remove Streamlit deprecation warnings)
+# Compatibility helpers (avoid Streamlit deprecation warnings)
 # =========================================================
 def plotly_show(fig):
     try:
@@ -143,15 +143,13 @@ def get_fear_greed(limit=200):
     raise RuntimeError(f"恐惧贪婪指数失败（alternative.me）。HTTP={code} err={err}")
 
 @st.cache_data(ttl=600)
-def get_deribit_vol_index(days: int = 120):
+def get_deribit_vol_index(days: int = 180):
     """
     Deribit volatility index data (BTC)
     Return (df, source, http_code)
 
     If endpoint is unavailable, raise and caller will fallback to RV30.
     """
-    # Common Deribit endpoint:
-    # https://www.deribit.com/api/v2/public/get_volatility_index_data?currency=BTC
     data, code, err = safe_get(
         "https://www.deribit.com/api/v2/public/get_volatility_index_data",
         params={"currency": "BTC"},
@@ -163,19 +161,17 @@ def get_deribit_vol_index(days: int = 120):
         rows = result.get("data") or result.get("volatility_index_data")
         if rows and isinstance(rows, list) and len(rows) > 5:
             df = pd.DataFrame(rows)
-            # expected: timestamp(ms), value
             if "timestamp" in df.columns and "value" in df.columns:
                 df["date"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-                df["iv"] = df["value"].astype(float) / 100.0  # convert to decimal if it's percentage-like
-                # Heuristic: if values look like 50-100, treat as % already and divide by 100.
-                # If values are 0.5-1.0 range, keep as-is.
-                if df["iv"].median() < 2.0:
-                    pass
-                else:
-                    df["iv"] = df["value"].astype(float) / 100.0
-                df = df[["date", "iv"]].sort_values("date").reset_index(drop=True)
 
-                # keep only recent N days
+                # Deribit values often look like 40~120 (percent); normalize to decimal
+                v = df["value"].astype(float)
+                if v.median() > 2.0:
+                    df["iv"] = v / 100.0
+                else:
+                    df["iv"] = v
+
+                df = df[["date", "iv"]].sort_values("date").reset_index(drop=True)
                 cutoff = df["date"].max() - pd.Timedelta(days=days)
                 df = df[df["date"] >= cutoff].reset_index(drop=True)
                 return df, "Deribit", 200
@@ -204,28 +200,27 @@ def percentile_rank(series: pd.Series, value: float):
         return np.nan
     return float((s < value).mean() * 100.0)
 
+def window_percentile(series: pd.Series, value: float, window_days: int):
+    """
+    percentile of value within last `window_days` points of series (assume daily-ish)
+    """
+    s = series.dropna().astype(float)
+    if len(s) == 0 or np.isnan(value):
+        return np.nan
+    s2 = s.iloc[-window_days:] if len(s) >= window_days else s
+    return percentile_rank(s2, value)
+
 def score_from_metrics(vol_pct, fng_value, band_pos):
-    """
-    0-100 score:
-    - lower vol percentile => higher score
-    - FNG near 50 better, extremes worse
-    - band position near mid better than extreme top
-    """
     score = 50.0
     if vol_pct is not None and not np.isnan(vol_pct):
-        score += (50.0 - vol_pct) * 0.4  # +/-20
+        score += (50.0 - vol_pct) * 0.4
     if fng_value is not None and not np.isnan(fng_value):
-        score += (25.0 - abs(fng_value - 50.0)) * 0.4  # max +10
+        score += (25.0 - abs(fng_value - 50.0)) * 0.4
     if band_pos is not None and not np.isnan(band_pos):
-        score += (0.25 - abs(band_pos - 0.5)) * 40.0  # max +10
+        score += (0.25 - abs(band_pos - 0.5)) * 40.0
     return float(np.clip(score, 0, 100))
 
 def build_rainbow_bands(df_price_all: pd.DataFrame):
-    """
-    Self-contained rainbow-like band:
-    log(price) ~ a + b*log(time)
-    Build bands using residual std in log space.
-    """
     df = df_price_all.dropna().reset_index(drop=True).copy()
     t = np.arange(1, len(df) + 1, dtype=float)
     x = np.log(t)
@@ -243,30 +238,39 @@ def build_rainbow_bands(df_price_all: pd.DataFrame):
         out[f"b{k:+.1f}"] = np.exp(y_hat + k * sigma)
     return out
 
+def band_index_from_pos(pos: float):
+    """
+    Convert 0..1 position into Band 1..8
+    """
+    if np.isnan(pos):
+        return None
+    idx = int(np.floor(pos * 8)) + 1
+    return int(np.clip(idx, 1, 8))
+
+def band_label_from_idx(idx: int):
+    labels = {
+        1: "Band 1（偏低）",
+        2: "Band 2（偏低）",
+        3: "Band 3（中低）",
+        4: "Band 4（中性）",
+        5: "Band 5（中性偏高）",
+        6: "Band 6（偏高）",
+        7: "Band 7（偏高）",
+        8: "Band 8（极高）",
+    }
+    return labels.get(idx, "N/A")
+
 def current_band_position(rainbow_df: pd.DataFrame):
     last = rainbow_df.iloc[-1]
     low = last["b-2.0"]
     high = last["b+2.0"]
     p = last["price"]
     if high <= low:
-        return np.nan, "N/A"
+        return np.nan, "N/A", None
     pos = float((p - low) / (high - low))
-    zones = [
-        (0.00, 0.125, "Band 1（偏低）"),
-        (0.125, 0.25, "Band 2（偏低）"),
-        (0.25, 0.375, "Band 3（中低）"),
-        (0.375, 0.5, "Band 4（中性）"),
-        (0.5, 0.625, "Band 5（中性偏高）"),
-        (0.625, 0.75, "Band 6（偏高）"),
-        (0.75, 0.875, "Band 7（偏高）"),
-        (0.875, 1.00, "Band 8（极高）"),
-    ]
-    label = zones[-1][2]
-    for lo, hi, name in zones:
-        if pos >= lo and pos < hi:
-            label = name
-            break
-    return pos, label
+    idx = band_index_from_pos(pos)
+    label = band_label_from_idx(idx) if idx else "N/A"
+    return pos, label, idx
 
 def gauge(value, title, subtitle=""):
     fig = go.Figure(go.Indicator(
@@ -279,25 +283,42 @@ def gauge(value, title, subtitle=""):
     fig.update_layout(height=220, margin=dict(l=10, r=10, t=40, b=10))
     return fig
 
-def small_card(title, value, footnote, bar_pct=None):
-    bar_html = ""
-    if bar_pct is not None and not np.isnan(bar_pct):
-        bar_pct = float(np.clip(bar_pct, 0, 100))
-        bar_html = f"""
-        <div style="margin-top:10px;background:rgba(255,255,255,0.06);border-radius:999px;height:8px;overflow:hidden;">
-          <div style="width:{bar_pct:.1f}%;height:8px;background:rgba(255,255,255,0.35);"></div>
+def kpi_card_like_ref(title, main_value, subline, p30=None, p90=None, extra_right=None):
+    """
+    Reference-like KPI card:
+    - title
+    - main value
+    - subline
+    - 30d/90d percentile bars
+    """
+    def bar(label, pct):
+        if pct is None or np.isnan(pct):
+            return ""
+        pct = float(np.clip(pct, 0, 100))
+        return f"""
+        <div style="display:flex;align-items:center;gap:8px;margin-top:8px;">
+          <div style="width:44px;font-size:11px;color:#9aa4b2;">{label}</div>
+          <div style="flex:1;background:rgba(255,255,255,0.06);border-radius:999px;height:8px;overflow:hidden;">
+            <div style="width:{pct:.1f}%;height:8px;background:rgba(255,255,255,0.35);"></div>
+          </div>
+          <div style="width:44px;text-align:right;font-size:11px;color:#9aa4b2;">{pct:.0f}%</div>
         </div>
-        <div style="font-size:11px;color:#9aa4b2;margin-top:6px;">分位：{bar_pct:.0f}%</div>
         """
+
+    extra = f"<div style='font-size:11px;color:#9aa4b2;margin-top:8px;'>{extra_right}</div>" if extra_right else ""
 
     st.markdown(
         f"""
         <div style="padding:14px;border:1px solid rgba(255,255,255,0.08);
         border-radius:12px;background:rgba(255,255,255,0.02);">
-          <div style="font-size:12px;color:#9aa4b2;margin-bottom:6px;">{title}</div>
-          <div style="font-size:22px;font-weight:700;margin-bottom:6px;">{value}</div>
-          <div style="font-size:12px;color:#9aa4b2;">{footnote}</div>
-          {bar_html}
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+            <div style="font-size:12px;color:#9aa4b2;">{title}</div>
+          </div>
+          <div style="font-size:22px;font-weight:700;margin-top:6px;">{main_value}</div>
+          <div style="font-size:12px;color:#9aa4b2;margin-top:6px;">{subline}</div>
+          {bar("30d", p30)}
+          {bar("90d", p90)}
+          {extra}
         </div>
         """,
         unsafe_allow_html=True
@@ -306,7 +327,7 @@ def small_card(title, value, footnote, bar_pct=None):
 # =========================================================
 # UI
 # =========================================================
-st.title("BTC 市场分析 Dashboard（抗限流 + IV + 彩虹带）")
+st.title("BTC 市场分析 Dashboard（方向1：KPI还原参考图）")
 
 _, right = st.columns([3, 1])
 with right:
@@ -333,18 +354,17 @@ try:
     spot, spot_src, _ = get_btc_spot_usd()
     source_status.append(("现价 Spot", spot_src, "OK"))
 
-    hist, hist_src, _ = get_btc_history_daily(days=max(365 * 3, days))  # more history for rainbow
+    hist, hist_src, _ = get_btc_history_daily(days=max(365 * 3, days))
     source_status.append(("历史日线", hist_src, "OK"))
 
     fng, fng_src, _ = get_fear_greed(limit=max(200, days + 30))
     source_status.append(("恐惧贪婪", fng_src, "OK"))
 
-    # Deribit IV (optional). If fails, fallback to RV30 as proxy.
     try:
         iv_df, iv_src, _ = get_deribit_vol_index(days=max(180, days))
         source_status.append(("期权IV指数", iv_src, "OK"))
         iv_is_proxy = False
-    except Exception as e:
+    except Exception:
         iv_df = None
         iv_src = "Proxy: RV30"
         source_status.append(("期权IV指数", iv_src, "FALLBACK"))
@@ -354,11 +374,9 @@ except Exception as e:
     st.error(f"数据拉取失败：{e}")
     st.stop()
 
-# Data source status panel
 with st.expander("数据源状态（点开查看）", expanded=False):
     df_status = pd.DataFrame(source_status, columns=["模块", "数据源", "状态"])
     dataframe_show(df_status)
-    st.caption("如果未来出现 429/403，这里会显示失败模块，方便快速定位。")
 
 # =========================================================
 # Slice + metrics
@@ -372,21 +390,25 @@ fng_slice = fng[fng["date"] >= (fng["date"].max() - pd.Timedelta(days=days))].re
 rv30 = realized_vol(hist, 30)
 rv90 = realized_vol(hist, 90)
 
+# Vol (use RV90 as DVOL proxy)
 rv90_last = float(rv90.dropna().iloc[-1]["rv90"]) if rv90["rv90"].notna().any() else np.nan
-rv90_pct = percentile_rank(rv90["rv90"], rv90_last)
+rv90_p30 = window_percentile(rv90["rv90"], rv90_last, 30)
+rv90_p90 = window_percentile(rv90["rv90"], rv90_last, 90)
 
+# FNG
 fng_last = float(fng_slice.iloc[-1]["value"]) if len(fng_slice) else np.nan
 fng_class = fng_slice.iloc[-1]["value_classification"] if len(fng_slice) else "N/A"
-fng_pct = percentile_rank(fng["value"], fng_last)
+fng_p30 = window_percentile(fng["value"], fng_last, 30)
+fng_p90 = window_percentile(fng["value"], fng_last, 90)
 
-# Rainbow
+# Rainbow band
 rainbow = build_rainbow_bands(hist)
-band_pos, band_label = current_band_position(rainbow)
+band_pos, band_label, band_idx = current_band_position(rainbow)
+band_text = f"Band {band_idx}/8" if band_idx else "Band N/A"
 
 # IV (Deribit or proxy)
 if iv_df is None:
-    iv_series = rv30.rename(columns={"rv30": "iv"}).copy()
-    iv_series = iv_series.dropna().reset_index(drop=True)
+    iv_series = rv30.rename(columns={"rv30": "iv"}).copy().dropna().reset_index(drop=True)
 else:
     iv_series = iv_df.copy().dropna().reset_index(drop=True)
 
@@ -394,61 +416,65 @@ iv_slice = iv_series[iv_series["date"] >= (iv_series["date"].max() - pd.Timedelt
 iv_last = float(iv_slice.iloc[-1]["iv"]) if len(iv_slice) else np.nan
 iv_prev = float(iv_slice.iloc[-2]["iv"]) if len(iv_slice) >= 2 else np.nan
 iv_change = (iv_last - iv_prev) if (not np.isnan(iv_last) and not np.isnan(iv_prev)) else np.nan
-iv_pct = percentile_rank(iv_series["iv"], iv_last) if len(iv_series) else np.nan
+iv_p30 = window_percentile(iv_series["iv"], iv_last, 30)
+iv_p90 = window_percentile(iv_series["iv"], iv_last, 90)
 
-score = score_from_metrics(rv90_pct, fng_last, band_pos)
+# Score
+vol_pct_for_score = percentile_rank(rv90["rv90"], rv90_last)
+score = score_from_metrics(vol_pct_for_score, fng_last, band_pos)
 
 # =========================================================
-# Top KPI row (closer to your reference)
+# KPI row (reference-like)
 # =========================================================
 c1, c2, c3, c4, c5 = st.columns([1.2, 1, 1, 1, 1])
 
 with c1:
-    plotly_show(gauge(score, f"{int(round(score))}", "综合市场状态"))
+    plotly_show(gauge(score, f"{int(round(score))}", "较好的状态" if score >= 60 else "偏谨慎"))
     st.caption(f"BTC Spot: ${spot:,.0f}  ·  Source: {spot_src}")
 
 with c2:
-    small_card(
-        "DVOL（Proxy: RV90）",
-        f"{rv90_last*100:.1f}%" if not np.isnan(rv90_last) else "N/A",
+    kpi_card_like_ref(
+        "IV 百分位（DVOL）",
+        f"DVOL {rv90_last*100:.1f}%" if not np.isnan(rv90_last) else "N/A",
         "波动率越高，风险越高",
-        bar_pct=rv90_pct
+        p30=rv90_p30,
+        p90=rv90_p90,
     )
 
 with c3:
-    small_card(
+    kpi_card_like_ref(
         "恐惧贪婪指数",
         f"{int(round(fng_last))}（{fng_class}）" if not np.isnan(fng_last) else "N/A",
-        "极端值往往意味着情绪拥挤",
-        bar_pct=fng_pct
+        "情绪极端 = 拥挤交易",
+        p30=fng_p30,
+        p90=fng_p90,
     )
 
 with c4:
-    small_card(
-        "彩虹带位置",
-        band_label,
-        f"位置: {band_pos:.2f}" if not np.isnan(band_pos) else "位置: N/A",
-        bar_pct=(band_pos * 100 if not np.isnan(band_pos) else None)
+    kpi_card_like_ref(
+        "比特币彩虹图",
+        f"{band_label}",
+        band_text,
+        p30=(band_pos * 100 if not np.isnan(band_pos) else None),
+        p90=None,
+        extra_right="（估值带位置）"
     )
 
 with c5:
     arrow = "▲" if (not np.isnan(iv_change) and iv_change >= 0) else "▼"
-    iv_name = "IV（Deribit）" if not iv_is_proxy else "IV（Proxy: RV30）"
-    small_card(
-        iv_name,
+    title = "IV 趋势（Deribit）" if not iv_is_proxy else "IV 趋势（Proxy）"
+    kpi_card_like_ref(
+        title,
         f"{iv_last*100:.1f}%" if not np.isnan(iv_last) else "N/A",
         f"24h: {arrow} {iv_change*100:+.2f}%" if not np.isnan(iv_change) else "24h: N/A",
-        bar_pct=iv_pct
+        p30=iv_p30,
+        p90=iv_p90,
     )
 
 st.divider()
 
 # =========================================================
-# Charts (match the 4-panel structure)
-# 1) DVOL/RV90 + price
-# 2) FNG + price
-# 3) Rainbow band (filled)
-# 4) IV trend + price
+# 4-panel charts (same structure)
 # =========================================================
 left1, right1 = st.columns(2)
 left2, right2 = st.columns(2)
@@ -484,27 +510,20 @@ with right1:
 
 with left2:
     st.subheader("比特币彩虹带（估值带）")
-    # show last ~3 years for readability
     rb = rainbow.copy()
     rb = rb[rb["date"] >= (rb["date"].max() - pd.Timedelta(days=365*3))].reset_index(drop=True)
 
     fig = go.Figure()
-
-    # Fill bands from low to high (simple layered fill)
     band_keys = ["b-2.0", "b-1.5", "b-1.0", "b-0.5", "b+0.0", "b+0.5", "b+1.0", "b+1.5", "b+2.0"]
-    # Start with lowest line
     fig.add_trace(go.Scatter(x=rb["date"], y=rb[band_keys[0]], name="Band low", line=dict(width=1), opacity=0.2))
-    # Fill successive bands
     for i in range(1, len(band_keys)):
         fig.add_trace(go.Scatter(
-            x=rb["date"],
-            y=rb[band_keys[i]],
+            x=rb["date"], y=rb[band_keys[i]],
             name=f"Band {i}",
             line=dict(width=1),
             fill="tonexty",
             opacity=0.12
         ))
-
     fig.add_trace(go.Scatter(x=rb["date"], y=rb["price"], name="BTC Price", line=dict(width=2)))
     fig.update_layout(
         height=360,
@@ -517,7 +536,6 @@ with left2:
 with right2:
     st.subheader(f"IV 趋势（{tf}）" + ("（Deribit）" if not iv_is_proxy else "（Proxy: RV30）"))
     fig = go.Figure()
-    # align price range to selected timeframe
     fig.add_trace(go.Scatter(x=hist_slice["date"], y=hist_slice["price"], name="BTC Price", yaxis="y2"))
     fig.add_trace(go.Scatter(x=iv_slice["date"], y=iv_slice["iv"] * 100, name="IV(%)"))
     fig.update_layout(
@@ -529,4 +547,4 @@ with right2:
     )
     plotly_show(fig)
 
-st.caption("说明：为避免 Cloud 环境限流，价格/历史主要用 CryptoCompare；Deribit IV 若不可用则自动回退到 RV30 代理。")
+st.caption("说明：方向1已完成：顶部 KPI 采用“主值 + 30d/90d 分位条 + Band X/8”格式，更贴近参考图。")
