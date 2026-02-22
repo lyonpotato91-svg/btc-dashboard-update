@@ -20,26 +20,33 @@ def safe_get(url, params=None, timeout=15, retries=3):
     """
     - Never raise_for_status (avoid crashing)
     - Retry on 429/5xx with backoff
-    - Return (json, status_code)
+    - Return (json, status_code, error_text)
     """
     last_status = None
+    last_err = ""
     for i in range(retries):
         try:
             r = requests.get(url, params=params, timeout=timeout, headers=DEFAULT_HEADERS)
             last_status = r.status_code
+
             if r.status_code == 200:
-                return r.json(), 200
+                return r.json(), 200, ""
 
             # rate limit / transient errors
             if r.status_code in (429, 500, 502, 503, 504):
                 time.sleep((2 ** i) + random.random())
                 continue
 
-            return None, r.status_code
-        except Exception:
+            # other errors - return and stop retrying
+            last_err = (r.text or "")[:200]
+            return None, r.status_code, last_err
+
+        except Exception as e:
+            last_err = str(e)[:200]
             time.sleep((2 ** i) + random.random())
             continue
-    return None, last_status or -1
+
+    return None, last_status or -1, last_err
 
 # -----------------------------
 # Data sources
@@ -48,34 +55,36 @@ def safe_get(url, params=None, timeout=15, retries=3):
 def get_btc_spot_usd():
     """
     Prefer Coinbase/Binance to avoid CoinGecko 429 on Streamlit Cloud.
-    Return (price, source)
+    Return (price, source, http_code)
     """
     # 1) Coinbase
-    data, code = safe_get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=12, retries=3)
+    data, code, err = safe_get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=12, retries=3)
     if data and "data" in data and "amount" in data["data"]:
-        return float(data["data"]["amount"]), "Coinbase"
+        return float(data["data"]["amount"]), "Coinbase", 200
+    coinbase_code = code
 
     # 2) Binance (USDT proxy)
-    data, code = safe_get("https://api.binance.com/api/v3/ticker/price", params={"symbol": "BTCUSDT"}, timeout=12, retries=3)
+    data, code, err = safe_get("https://api.binance.com/api/v3/ticker/price", params={"symbol": "BTCUSDT"}, timeout=12, retries=3)
     if data and "price" in data:
-        return float(data["price"]), "Binance"
+        return float(data["price"]), "Binance", 200
+    binance_code = code
 
     # 3) CryptoCompare price
-    data, code = safe_get("https://min-api.cryptocompare.com/data/price", params={"fsym": "BTC", "tsyms": "USD"}, timeout=12, retries=3)
+    data, code, err = safe_get("https://min-api.cryptocompare.com/data/price", params={"fsym": "BTC", "tsyms": "USD"}, timeout=12, retries=3)
     if data and "USD" in data:
-        return float(data["USD"]), "CryptoCompare"
+        return float(data["USD"]), "CryptoCompare", 200
+    cc_code = code
 
-    raise RuntimeError("现价数据源全部失败（Coinbase/Binance/CryptoCompare）。")
+    raise RuntimeError(f"现价数据源全部失败：Coinbase HTTP={coinbase_code}, Binance HTTP={binance_code}, CryptoCompare HTTP={cc_code}")
 
 @st.cache_data(ttl=600)
 def get_btc_history_daily(days: int = 365):
     """
     Use CryptoCompare histoday as PRIMARY to avoid CoinGecko 429.
-    Return DataFrame: date, price (UTC)
+    Return (df, source, http_code)
     """
-    # CryptoCompare histoday: max ~2000 points without key
     limit = int(min(max(days, 30), 2000)) - 1
-    data, code = safe_get(
+    data, code, err = safe_get(
         "https://min-api.cryptocompare.com/data/v2/histoday",
         params={"fsym": "BTC", "tsym": "USD", "limit": limit},
         timeout=20,
@@ -87,20 +96,24 @@ def get_btc_history_daily(days: int = 365):
         df["date"] = pd.to_datetime(df["time"], unit="s", utc=True)
         df["price"] = df["close"].astype(float)
         df = df[["date", "price"]].sort_values("date").reset_index(drop=True)
-        return df
+        return df, "CryptoCompare", 200
 
-    raise RuntimeError(f"历史价格失败（CryptoCompare）。HTTP={code}")
+    raise RuntimeError(f"历史价格失败（CryptoCompare）。HTTP={code} err={err}")
 
 @st.cache_data(ttl=600)
 def get_fear_greed(limit=200):
-    data, code = safe_get("https://api.alternative.me/fng/", params={"limit": limit, "format": "json"}, timeout=20, retries=3)
-    if not data or "data" not in data:
-        raise RuntimeError(f"恐惧贪婪指数失败（alternative.me）。HTTP={code}")
+    """
+    Return (df, source, http_code)
+    """
+    data, code, err = safe_get("https://api.alternative.me/fng/", params={"limit": limit, "format": "json"}, timeout=20, retries=3)
+    if data and "data" in data:
+        df = pd.DataFrame(data["data"])
+        df["value"] = df["value"].astype(float)
+        df["date"] = pd.to_datetime(df["timestamp"].astype(int), unit="s", utc=True)
+        df = df.sort_values("date").reset_index(drop=True)[["date", "value", "value_classification"]]
+        return df, "alternative.me", 200
 
-    df = pd.DataFrame(data["data"])
-    df["value"] = df["value"].astype(float)
-    df["date"] = pd.to_datetime(df["timestamp"].astype(int), unit="s", utc=True)
-    return df.sort_values("date").reset_index(drop=True)[["date", "value", "value_classification"]]
+    raise RuntimeError(f"恐惧贪婪指数失败（alternative.me）。HTTP={code} err={err}")
 
 # -----------------------------
 # Indicators
@@ -153,6 +166,7 @@ def small_card(title, value, footnote):
 # -----------------------------
 st.title("BTC 市场分析 Dashboard（免本地部署版 / 抗限流）")
 
+# Controls (right)
 _, right = st.columns([3, 1])
 with right:
     tf = st.radio("时间范围", ["7d", "30d", "90d", "180d", "1Y"], horizontal=True, index=2)
@@ -172,20 +186,38 @@ days = days_map[tf]
 # -----------------------------
 # Load data
 # -----------------------------
+source_status = []
+
 try:
-    spot, spot_src = get_btc_spot_usd()
-    hist = get_btc_history_daily(days=max(365 * 2, days))
-    hist_slice = hist[hist["date"] >= (hist["date"].max() - pd.Timedelta(days=days))].reset_index(drop=True)
+    spot, spot_src, _ = get_btc_spot_usd()
+    source_status.append(("现价 Spot", spot_src, "OK"))
 
-    fng = get_fear_greed(limit=max(200, days + 20))
-    fng_slice = fng[fng["date"] >= (fng["date"].max() - pd.Timedelta(days=days))].reset_index(drop=True)
+    hist, hist_src, _ = get_btc_history_daily(days=max(365 * 2, days))
+    source_status.append(("历史日线", hist_src, "OK"))
 
-    rv30 = realized_vol(hist, 30)
-    rv90 = realized_vol(hist, 90)
+    fng, fng_src, _ = get_fear_greed(limit=max(200, days + 20))
+    source_status.append(("恐惧贪婪", fng_src, "OK"))
 
 except Exception as e:
     st.error(f"数据拉取失败：{e}")
     st.stop()
+
+# -----------------------------
+# Data source status panel
+# -----------------------------
+with st.expander("数据源状态（点开查看）", expanded=False):
+    df_status = pd.DataFrame(source_status, columns=["模块", "数据源", "状态"])
+    st.dataframe(df_status, use_container_width=True)
+    st.caption("如果出现 429/403，这里会显示失败模块，方便快速定位。")
+
+# -----------------------------
+# Slice data
+# -----------------------------
+hist_slice = hist[hist["date"] >= (hist["date"].max() - pd.Timedelta(days=days))].reset_index(drop=True)
+fng_slice = fng[fng["date"] >= (fng["date"].max() - pd.Timedelta(days=days))].reset_index(drop=True)
+
+rv30 = realized_vol(hist, 30)
+rv90 = realized_vol(hist, 90)
 
 # -----------------------------
 # KPIs
