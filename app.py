@@ -34,7 +34,7 @@ DEFAULT_HEADERS = {
 def safe_get(url, params=None, timeout=15, retries=3):
     """
     Return (json, status_code, error_text)
-    - Never raise_for_status (avoid crashing)
+    - Never raise_for_status
     - Retry on 429/5xx with backoff
     """
     last_status = None
@@ -184,53 +184,35 @@ def in_range(x, lo, hi):
     return (x >= lo) and (x <= hi)
 
 def detect_ut_fake_breakout(df_tf: pd.DataFrame, level: float, lookback_bars: int = 6):
-    """
-    UT: close > level, then within next lookback_bars closes back below level.
-    """
     if len(df_tf) < lookback_bars + 3:
         return False, "数据不足"
-
     closes = df_tf["close"].values
     idxs = np.where(closes > level)[0]
     if len(idxs) == 0:
         return False, "未突破上沿"
-
     last_break = idxs[-1]
     end = min(len(df_tf) - 1, last_break + lookback_bars)
     after = df_tf.iloc[last_break:end + 1]
-
     if (after["close"] < level).any():
         return True, f"突破后 {lookback_bars} 根内收回下方"
     return False, "突破但未收回（观察）"
 
 def detect_break_retest_fail(df_tf: pd.DataFrame, level: float, tolerance: float = 0.006, lookback: int = 60):
-    """
-    Break below level, then retest near level (within tolerance), but closes below level.
-    """
     if len(df_tf) < 30:
         return False, "数据不足"
-
     df = df_tf.iloc[-lookback:].copy() if len(df_tf) > lookback else df_tf.copy()
-
-    # find a break: close < level
     idxs = np.where(df["close"].values < level)[0]
     if len(idxs) == 0:
         return False, "未跌破下沿"
-
     last_break = idxs[-1]
     after = df.iloc[last_break:].copy()
     lo, hi = level * (1 - tolerance), level * (1 + tolerance)
-
-    # retest: high touches near zone, but close stays below level
     cond = (after["high"].between(lo, hi)) & (after["close"] < level)
     if cond.any():
         return True, f"回踩触及 {lo:.0f}-{hi:.0f} 但收不回 {level:.0f}"
     return False, "跌破后尚未出现回踩失败"
 
 def swing_highs(df: pd.DataFrame, left: int = 2, right: int = 2):
-    """
-    Return indices of swing highs: high greater than neighbors.
-    """
     highs = df["high"].values
     idxs = []
     for i in range(left, len(df) - right):
@@ -239,26 +221,17 @@ def swing_highs(df: pd.DataFrame, left: int = 2, right: int = 2):
     return idxs
 
 def detect_lower_high(df_tf: pd.DataFrame, lookback_swings: int = 4):
-    """
-    Detect LH using last swing highs. True if last swing high < previous swing high.
-    """
     if len(df_tf) < 20:
         return False, "数据不足"
-
     idxs = swing_highs(df_tf, left=2, right=2)
     if len(idxs) < 2:
         return False, "未形成足够摆动高点"
-
-    # take last two swings (or last N)
     idxs = idxs[-lookback_swings:] if len(idxs) > lookback_swings else idxs
     if len(idxs) < 2:
         return False, "摆动点不足"
-
-    last_i = idxs[-1]
-    prev_i = idxs[-2]
+    last_i, prev_i = idxs[-1], idxs[-2]
     last_high = float(df_tf.iloc[last_i]["high"])
     prev_high = float(df_tf.iloc[prev_i]["high"])
-
     if last_high < prev_high:
         return True, f"LH：{last_high:.0f} < {prev_high:.0f}"
     return False, f"非LH：{last_high:.0f} ≥ {prev_high:.0f}"
@@ -272,27 +245,16 @@ def candle_features(row):
     return body, rng, upper, lower
 
 def detect_bearish_patterns(df_tf: pd.DataFrame):
-    """
-    Wyckoff-ish bearish clues near top:
-    - Shooting star / Upthrust style: long upper wick, small body, close not at high
-    - Bearish engulfing: current body engulfs previous body (down)
-    Return (bool, reason)
-    """
     if len(df_tf) < 3:
         return False, "数据不足"
-
     cur = df_tf.iloc[-1]
     prev = df_tf.iloc[-2]
 
     body, rng, upper, lower = candle_features(cur)
-    body_prev, rng_prev, upper_prev, lower_prev = candle_features(prev)
 
-    # Shooting star / upthrust-ish
-    # long upper wick (>= 55% of range), body small (<= 30% of range), close in lower half
     close_lower_half = float(cur["close"]) <= (float(cur["low"]) + 0.5 * (float(cur["high"]) - float(cur["low"])))
     shoot = (upper / rng >= 0.55) and (body / rng <= 0.30) and close_lower_half
 
-    # Bearish engulfing: prev green or small, cur red and cur body fully covers prev body
     prev_o, prev_c = float(prev["open"]), float(prev["close"])
     cur_o, cur_c = float(cur["open"]), float(cur["close"])
     prev_low_body = min(prev_o, prev_c)
@@ -309,12 +271,11 @@ def detect_bearish_patterns(df_tf: pd.DataFrame):
         return True, "看跌吞没（Bearish engulfing）"
     return False, "未出现典型顶部K线"
 
-def top_detector(df_4h: pd.DataFrame, box_high: float, near_pct: float = 0.015):
+def top_detector(df_4h: pd.DataFrame, box_high: float, near_pct: float = 0.015, mode: str = "宽松"):
     """
-    Combine:
-    - LH structure
-    - bearish candlestick
-    - near top area (price near box_high)
+    mode:
+      - "宽松": near_top AND (LH OR bearish_pattern)
+      - "严格": near_top AND (LH AND bearish_pattern)
     Return (triggered, reasons)
     """
     if df_4h is None or len(df_4h) < 30:
@@ -327,20 +288,20 @@ def top_detector(df_4h: pd.DataFrame, box_high: float, near_pct: float = 0.015):
     pat_ok, pat_info = detect_bearish_patterns(df_4h)
 
     reasons = []
-    if near_top:
-        reasons.append(f"接近上沿（≥ {box_high*(1-near_pct):.0f}）")
-    else:
-        reasons.append("不在上沿附近（弱）")
-
+    reasons.append(f"接近上沿阈值：≥ {box_high*(1-near_pct):.0f}（当前 close={last_close:.0f}）" if near_top else f"未接近上沿（当前 close={last_close:.0f}）")
     reasons.append(lh_info)
     reasons.append(pat_info)
+    reasons.append(f"模式：{mode}")
 
-    # Trigger rule: near_top AND (LH or bearish pattern)
-    triggered = near_top and (lh_ok or pat_ok)
+    if mode == "严格":
+        triggered = near_top and lh_ok and pat_ok
+    else:
+        triggered = near_top and (lh_ok or pat_ok)
+
     return triggered, reasons
 
 # =========================================================
-# Simple KPI helpers (optional)
+# Optional KPIs
 # =========================================================
 def realized_vol(df_price: pd.DataFrame, window_days: int = 30):
     px = df_price["price"].astype(float).values
@@ -359,17 +320,6 @@ def percentile_rank(series: pd.Series, value: float):
     if len(s) == 0 or np.isnan(value):
         return np.nan
     return float((s < value).mean() * 100.0)
-
-def gauge(value, title, subtitle=""):
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=value,
-        number={"font": {"size": 34}},
-        title={"text": f"{title}<br><span style='font-size:12px;color:#888'>{subtitle}</span>"},
-        gauge={"axis": {"range": [0, 100]}, "bar": {"thickness": 0.3}}
-    ))
-    fig.update_layout(height=220, margin=dict(l=10, r=10, t=40, b=10))
-    return fig
 
 def score_from_metrics(vol_pct, fng_value, band_pos):
     score = 50.0
@@ -418,10 +368,21 @@ def current_band_position(rainbow_df: pd.DataFrame):
     }
     return pos, labels.get(idx, "N/A")
 
+def gauge(value, title, subtitle=""):
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=value,
+        number={"font": {"size": 34}},
+        title={"text": f"{title}<br><span style='font-size:12px;color:#888'>{subtitle}</span>"},
+        gauge={"axis": {"range": [0, 100]}, "bar": {"thickness": 0.3}}
+    ))
+    fig.update_layout(height=220, margin=dict(l=10, r=10, t=40, b=10))
+    return fig
+
 # =========================================================
 # UI
 # =========================================================
-st.title("BTC 市场分析 Dashboard（含威科夫做空累计提示 + 顶部判定器）")
+st.title("BTC 市场分析 Dashboard（含威科夫做空累计提示 + 顶部判定器 宽松/严格）")
 
 _, right = st.columns([3, 1])
 with right:
@@ -439,7 +400,6 @@ if auto:
 days_map = {"7d": 7, "30d": 30, "90d": 90, "180d": 180, "1Y": 365}
 days = days_map[tf]
 
-# Sidebar strategy config
 with st.sidebar:
     st.markdown("## 策略参数（可改）")
     upper_zone_lo = st.number_input("箱体上沿加空区下限", value=70000, step=500)
@@ -449,6 +409,9 @@ with st.sidebar:
     retest_tol = st.slider("回踩容差（%）", min_value=0.2, max_value=2.0, value=0.6, step=0.1) / 100.0
     ut_lookback = st.slider("UT 收回窗口（4H根数）", min_value=2, max_value=12, value=6, step=1)
     near_top_pct = st.slider("顶部判定：接近上沿阈值（%）", min_value=0.5, max_value=5.0, value=1.5, step=0.1) / 100.0
+
+    top_mode = st.radio("顶部判定器模式", ["宽松", "严格"], index=0)
+    st.caption("宽松：接近上沿 AND（LH 或 顶部K线）\n\n严格：接近上沿 AND（LH 且 顶部K线）")
 
 # =========================================================
 # Load data
@@ -464,7 +427,6 @@ try:
     fng, fng_src, _ = get_fear_greed(limit=max(200, days + 30))
     source_status.append(("恐惧贪婪", fng_src, "OK"))
 
-    # Hourly for 4H/8H
     df_1h = get_btc_history_hourly(hours=24 * 60)
     source_status.append(("小时线(用于4H/8H)", "CryptoCompare", "OK"))
 
@@ -475,9 +437,7 @@ except Exception as e:
 with st.expander("数据源状态（点开查看）", expanded=False):
     dataframe_show(pd.DataFrame(source_status, columns=["模块", "数据源", "状态"]))
 
-# =========================================================
 # Prepare datasets
-# =========================================================
 hist = hist.sort_values("date").reset_index(drop=True)
 hist_slice = hist[hist["date"] >= (hist["date"].max() - pd.Timedelta(days=days))].reset_index(drop=True)
 
@@ -487,30 +447,23 @@ fng_slice = fng[fng["date"] >= (fng["date"].max() - pd.Timedelta(days=days))].re
 df_4h = resample_ohlcv(df_1h, "4H")
 df_8h = resample_ohlcv(df_1h, "8H")
 
-# Vol proxies
+# KPIs (optional)
 rv90 = realized_vol(hist, 90)
 rv90_last = float(rv90.dropna().iloc[-1]["rv90"]) if rv90["rv90"].notna().any() else np.nan
 vol_pct = percentile_rank(rv90["rv90"], rv90_last)
 
-# FNG
 fng_last = float(fng_slice.iloc[-1]["value"]) if len(fng_slice) else np.nan
 
-# Rainbow
 rainbow = build_rainbow_bands(hist)
 band_pos, band_label = current_band_position(rainbow)
 
-# Score (optional)
 score = score_from_metrics(vol_pct, fng_last, band_pos)
 
-# =========================================================
-# TOP KPIs (simple)
-# =========================================================
+# Top KPIs
 c1, c2, c3 = st.columns([1.2, 1, 1])
-
 with c1:
     plotly_show(gauge(score, f"{int(round(score))}", "综合市场状态"))
     st.caption(f"BTC Spot: ${spot:,.0f}  ·  Source: {spot_src}")
-
 with c2:
     st.metric("箱体上沿", f"{upper_zone_lo:,.0f} – {upper_zone_hi:,.0f}", "优先加空关注区")
 with c3:
@@ -518,11 +471,8 @@ with c3:
 
 st.divider()
 
-# =========================================================
-# Strategy Panel (Wyckoff short accumulation map)
-# =========================================================
-st.subheader("策略提示（做空累计：上沿做空 + 假突破UT + 破位回踩）")
-
+# Strategy Panel
+st.subheader("策略提示（做空累计：上沿做空 + UT + 破位回踩 + 顶部判定器）")
 current_price = float(spot)
 
 in_upper_zone = in_range(current_price, upper_zone_lo, upper_zone_hi)
@@ -531,9 +481,7 @@ below_lower = current_price < lower_level
 
 ut_triggered, ut_info = detect_ut_fake_breakout(df_4h, upper_level, lookback_bars=int(ut_lookback))
 br_triggered, br_info = detect_break_retest_fail(df_4h, lower_level, tolerance=float(retest_tol))
-
-# NEW: Top detector (LH + bearish candlesticks near top)
-top_triggered, top_reasons = top_detector(df_4h, upper_level, near_pct=float(near_top_pct))
+top_triggered, top_reasons = top_detector(df_4h, upper_level, near_pct=float(near_top_pct), mode=str(top_mode))
 
 def badge(text, ok=True):
     color = "#2ecc71" if ok else "#f39c12"
@@ -558,14 +506,13 @@ with colB:
     badge(f"破位回踩失败：{br_info}", br_triggered)
 
     st.markdown("**顶部判定器（更贴威科夫）**")
-    badge("顶部判定器触发（LH 或 顶部K线）", top_triggered)
+    badge(f"顶部判定器触发（{top_mode}）", top_triggered)
     with st.expander("顶部判定器细节", expanded=False):
         for r in top_reasons:
             st.write(f"- {r}")
 
 with colC:
     st.markdown("**操作层（Dashboard 提示）**")
-
     if br_triggered:
         st.info("✅ **确认空点：破位后回踩失败**\n\n已跌破下沿并回踩不过（结构确认转弱），按你的框架属于更“稳健”的加空类型。")
     elif ut_triggered:
@@ -573,17 +520,15 @@ with colC:
     elif in_upper_zone and top_triggered:
         st.warning("🟡 **可考虑分批加空：上沿 + 顶部判定器确认**\n\n你已经在上沿区域，同时出现 LH/顶部K线失败形态，符合“位置好 + 到顶部才加空”。")
     elif in_upper_zone:
-        st.success("🟢 **进入加空关注区（上沿）**\n\n但还缺“顶部确认”（LH 或 失败K线 / UT）。按框架：更适合耐心等触发再动。")
+        st.success("🟢 **进入加空关注区（上沿）**\n\n但还缺顶部确认（按模式判定）。更适合耐心等触发再动。")
     else:
         st.success("🟢 **当前不在理想加仓区**\n\n按你的框架更像‘等位置/等信号’，避免在箱体中段情绪化加仓。")
 
-st.caption("说明：顶部判定器使用 4H 摆动高点（LH）+ 顶部失败K线（长上影/吞没）组合；触发后会更贴近“短周期到顶部才加空”的口径。")
+st.caption("说明：顶部判定器=接近上沿 +（LH 与/或 顶部失败K线），可切换宽松/严格以调整触发频率。")
 
 st.divider()
 
-# =========================================================
-# Charts (optional, keep simple 4 panels)
-# =========================================================
+# Charts
 left1, right1 = st.columns(2)
 left2, right2 = st.columns(2)
 
@@ -591,7 +536,6 @@ with left1:
     st.subheader("价格（日线）+ 关键位")
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=hist_slice["date"], y=hist_slice["price"], name="BTC Price"))
-    # key levels
     fig.add_hline(y=float(upper_level), line_width=1, opacity=0.5)
     fig.add_hline(y=float(lower_level), line_width=1, opacity=0.5)
     fig.update_layout(height=360, margin=dict(l=10, r=10, t=30, b=10), yaxis=dict(title="Price USD"))
@@ -599,8 +543,7 @@ with left1:
 
 with right1:
     st.subheader("4H K线（近60天）")
-    d = df_4h.copy()
-    d = d.tail(300)
+    d = df_4h.tail(300).copy()
     fig = go.Figure(data=[go.Candlestick(
         x=d["date"],
         open=d["open"], high=d["high"], low=d["low"], close=d["close"],
@@ -649,4 +592,4 @@ with right2:
     )
     plotly_show(fig)
 
-st.caption("提示：你现在的框架=“上沿等顶部确认加空；更优=UT；确认=破位回踩失败；做多等SC/二测”。仪表盘已把这些变成可打勾的规则提示。")
+st.caption("提示：上沿等顶部确认加空；更优=UT；确认=破位回踩失败；做多等更恐慌的SC/二测。")
