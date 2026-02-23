@@ -142,44 +142,205 @@ def get_fear_greed(limit=200):
 
     raise RuntimeError(f"恐惧贪婪指数失败（alternative.me）。HTTP={code} err={err}")
 
-@st.cache_data(ttl=600)
-def get_deribit_vol_index(days: int = 180):
+@st.cache_data(ttl=120)
+def get_btc_history_hourly(hours: int = 24 * 60):
     """
-    Deribit volatility index data (BTC)
-    Return (df, source, http_code)
-
-    If endpoint is unavailable, raise and caller will fallback to RV30.
+    CryptoCompare histohour
+    Return df: date, open, high, low, close, volume
     """
+    limit = int(min(max(hours, 24), 2000)) - 1
     data, code, err = safe_get(
-        "https://www.deribit.com/api/v2/public/get_volatility_index_data",
-        params={"currency": "BTC"},
+        "https://min-api.cryptocompare.com/data/v2/histohour",
+        params={"fsym": "BTC", "tsym": "USD", "limit": limit},
         timeout=20,
-        retries=3
+        retries=3,
     )
-    if data and data.get("result"):
-        result = data["result"]
-        rows = result.get("data") or result.get("volatility_index_data")
-        if rows and isinstance(rows, list) and len(rows) > 5:
-            df = pd.DataFrame(rows)
-            if "timestamp" in df.columns and "value" in df.columns:
-                df["date"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    if data and data.get("Response") == "Success":
+        rows = data["Data"]["Data"]
+        df = pd.DataFrame(rows)
+        df["date"] = pd.to_datetime(df["time"], unit="s", utc=True)
+        df = df.rename(columns={"volumeto": "volume"})
+        for c in ["open", "high", "low", "close", "volume"]:
+            df[c] = df[c].astype(float)
+        return df[["date", "open", "high", "low", "close", "volume"]].sort_values("date").reset_index(drop=True)
 
-                # Deribit values often look like 40~120 (percent); normalize to decimal
-                v = df["value"].astype(float)
-                if v.median() > 2.0:
-                    df["iv"] = v / 100.0
-                else:
-                    df["iv"] = v
-
-                df = df[["date", "iv"]].sort_values("date").reset_index(drop=True)
-                cutoff = df["date"].max() - pd.Timedelta(days=days)
-                df = df[df["date"] >= cutoff].reset_index(drop=True)
-                return df, "Deribit", 200
-
-    raise RuntimeError(f"Deribit IV 指数失败。HTTP={code} err={err}")
+    raise RuntimeError(f"小时线失败（CryptoCompare）。HTTP={code} err={err}")
 
 # =========================================================
-# Indicators / Analytics
+# Resample & Wyckoff-ish top detector (LH + candlesticks)
+# =========================================================
+def resample_ohlcv(df_1h: pd.DataFrame, rule: str):
+    d = df_1h.set_index("date").copy()
+    out = d.resample(rule).agg({
+        "open": "first",
+        "high": "max",
+        "low": "min",
+        "close": "last",
+        "volume": "sum"
+    }).dropna().reset_index()
+    return out
+
+def in_range(x, lo, hi):
+    return (x >= lo) and (x <= hi)
+
+def detect_ut_fake_breakout(df_tf: pd.DataFrame, level: float, lookback_bars: int = 6):
+    """
+    UT: close > level, then within next lookback_bars closes back below level.
+    """
+    if len(df_tf) < lookback_bars + 3:
+        return False, "数据不足"
+
+    closes = df_tf["close"].values
+    idxs = np.where(closes > level)[0]
+    if len(idxs) == 0:
+        return False, "未突破上沿"
+
+    last_break = idxs[-1]
+    end = min(len(df_tf) - 1, last_break + lookback_bars)
+    after = df_tf.iloc[last_break:end + 1]
+
+    if (after["close"] < level).any():
+        return True, f"突破后 {lookback_bars} 根内收回下方"
+    return False, "突破但未收回（观察）"
+
+def detect_break_retest_fail(df_tf: pd.DataFrame, level: float, tolerance: float = 0.006, lookback: int = 60):
+    """
+    Break below level, then retest near level (within tolerance), but closes below level.
+    """
+    if len(df_tf) < 30:
+        return False, "数据不足"
+
+    df = df_tf.iloc[-lookback:].copy() if len(df_tf) > lookback else df_tf.copy()
+
+    # find a break: close < level
+    idxs = np.where(df["close"].values < level)[0]
+    if len(idxs) == 0:
+        return False, "未跌破下沿"
+
+    last_break = idxs[-1]
+    after = df.iloc[last_break:].copy()
+    lo, hi = level * (1 - tolerance), level * (1 + tolerance)
+
+    # retest: high touches near zone, but close stays below level
+    cond = (after["high"].between(lo, hi)) & (after["close"] < level)
+    if cond.any():
+        return True, f"回踩触及 {lo:.0f}-{hi:.0f} 但收不回 {level:.0f}"
+    return False, "跌破后尚未出现回踩失败"
+
+def swing_highs(df: pd.DataFrame, left: int = 2, right: int = 2):
+    """
+    Return indices of swing highs: high greater than neighbors.
+    """
+    highs = df["high"].values
+    idxs = []
+    for i in range(left, len(df) - right):
+        if highs[i] > max(highs[i-left:i]) and highs[i] > max(highs[i+1:i+1+right]):
+            idxs.append(i)
+    return idxs
+
+def detect_lower_high(df_tf: pd.DataFrame, lookback_swings: int = 4):
+    """
+    Detect LH using last swing highs. True if last swing high < previous swing high.
+    """
+    if len(df_tf) < 20:
+        return False, "数据不足"
+
+    idxs = swing_highs(df_tf, left=2, right=2)
+    if len(idxs) < 2:
+        return False, "未形成足够摆动高点"
+
+    # take last two swings (or last N)
+    idxs = idxs[-lookback_swings:] if len(idxs) > lookback_swings else idxs
+    if len(idxs) < 2:
+        return False, "摆动点不足"
+
+    last_i = idxs[-1]
+    prev_i = idxs[-2]
+    last_high = float(df_tf.iloc[last_i]["high"])
+    prev_high = float(df_tf.iloc[prev_i]["high"])
+
+    if last_high < prev_high:
+        return True, f"LH：{last_high:.0f} < {prev_high:.0f}"
+    return False, f"非LH：{last_high:.0f} ≥ {prev_high:.0f}"
+
+def candle_features(row):
+    o, h, l, c = float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"])
+    body = abs(c - o)
+    rng = max(h - l, 1e-9)
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+    return body, rng, upper, lower
+
+def detect_bearish_patterns(df_tf: pd.DataFrame):
+    """
+    Wyckoff-ish bearish clues near top:
+    - Shooting star / Upthrust style: long upper wick, small body, close not at high
+    - Bearish engulfing: current body engulfs previous body (down)
+    Return (bool, reason)
+    """
+    if len(df_tf) < 3:
+        return False, "数据不足"
+
+    cur = df_tf.iloc[-1]
+    prev = df_tf.iloc[-2]
+
+    body, rng, upper, lower = candle_features(cur)
+    body_prev, rng_prev, upper_prev, lower_prev = candle_features(prev)
+
+    # Shooting star / upthrust-ish
+    # long upper wick (>= 55% of range), body small (<= 30% of range), close in lower half
+    close_lower_half = float(cur["close"]) <= (float(cur["low"]) + 0.5 * (float(cur["high"]) - float(cur["low"])))
+    shoot = (upper / rng >= 0.55) and (body / rng <= 0.30) and close_lower_half
+
+    # Bearish engulfing: prev green or small, cur red and cur body fully covers prev body
+    prev_o, prev_c = float(prev["open"]), float(prev["close"])
+    cur_o, cur_c = float(cur["open"]), float(cur["close"])
+    prev_low_body = min(prev_o, prev_c)
+    prev_high_body = max(prev_o, prev_c)
+    cur_low_body = min(cur_o, cur_c)
+    cur_high_body = max(cur_o, cur_c)
+    bearish = (cur_c < cur_o) and (cur_low_body <= prev_low_body) and (cur_high_body >= prev_high_body)
+
+    if shoot and bearish:
+        return True, "长上影 + 看跌吞没（强顶部信号）"
+    if shoot:
+        return True, "长上影（Upthrust/Shooting star）"
+    if bearish:
+        return True, "看跌吞没（Bearish engulfing）"
+    return False, "未出现典型顶部K线"
+
+def top_detector(df_4h: pd.DataFrame, box_high: float, near_pct: float = 0.015):
+    """
+    Combine:
+    - LH structure
+    - bearish candlestick
+    - near top area (price near box_high)
+    Return (triggered, reasons)
+    """
+    if df_4h is None or len(df_4h) < 30:
+        return False, ["数据不足"]
+
+    last_close = float(df_4h.iloc[-1]["close"])
+    near_top = last_close >= box_high * (1 - near_pct)
+
+    lh_ok, lh_info = detect_lower_high(df_4h, lookback_swings=4)
+    pat_ok, pat_info = detect_bearish_patterns(df_4h)
+
+    reasons = []
+    if near_top:
+        reasons.append(f"接近上沿（≥ {box_high*(1-near_pct):.0f}）")
+    else:
+        reasons.append("不在上沿附近（弱）")
+
+    reasons.append(lh_info)
+    reasons.append(pat_info)
+
+    # Trigger rule: near_top AND (LH or bearish pattern)
+    triggered = near_top and (lh_ok or pat_ok)
+    return triggered, reasons
+
+# =========================================================
+# Simple KPI helpers (optional)
 # =========================================================
 def realized_vol(df_price: pd.DataFrame, window_days: int = 30):
     px = df_price["price"].astype(float).values
@@ -187,7 +348,6 @@ def realized_vol(df_price: pd.DataFrame, window_days: int = 30):
         out = df_price.copy()
         out[f"rv{window_days}"] = np.nan
         return out[["date", f"rv{window_days}"]]
-
     rets = np.diff(np.log(px))
     roll = pd.Series(rets).rolling(window_days).std() * np.sqrt(365)
     out = df_price.iloc[1:].copy()
@@ -200,15 +360,16 @@ def percentile_rank(series: pd.Series, value: float):
         return np.nan
     return float((s < value).mean() * 100.0)
 
-def window_percentile(series: pd.Series, value: float, window_days: int):
-    """
-    percentile of value within last `window_days` points of series (assume daily-ish)
-    """
-    s = series.dropna().astype(float)
-    if len(s) == 0 or np.isnan(value):
-        return np.nan
-    s2 = s.iloc[-window_days:] if len(s) >= window_days else s
-    return percentile_rank(s2, value)
+def gauge(value, title, subtitle=""):
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=value,
+        number={"font": {"size": 34}},
+        title={"text": f"{title}<br><span style='font-size:12px;color:#888'>{subtitle}</span>"},
+        gauge={"axis": {"range": [0, 100]}, "bar": {"thickness": 0.3}}
+    ))
+    fig.update_layout(height=220, margin=dict(l=10, r=10, t=40, b=10))
+    return fig
 
 def score_from_metrics(vol_pct, fng_value, band_pos):
     score = 50.0
@@ -225,29 +386,26 @@ def build_rainbow_bands(df_price_all: pd.DataFrame):
     t = np.arange(1, len(df) + 1, dtype=float)
     x = np.log(t)
     y = np.log(df["price"].astype(float).values)
-
     b = np.cov(x, y, bias=True)[0, 1] / np.var(x)
     a = y.mean() - b * x.mean()
     y_hat = a + b * x
     resid = y - y_hat
     sigma = resid.std()
-
     ks = np.array([-2.0, -1.5, -1.0, -0.5, 0.0, 0.5, 1.0, 1.5, 2.0])
     out = pd.DataFrame({"date": df["date"], "price": df["price"].astype(float)})
     for k in ks:
         out[f"b{k:+.1f}"] = np.exp(y_hat + k * sigma)
     return out
 
-def band_index_from_pos(pos: float):
-    """
-    Convert 0..1 position into Band 1..8
-    """
-    if np.isnan(pos):
-        return None
-    idx = int(np.floor(pos * 8)) + 1
-    return int(np.clip(idx, 1, 8))
-
-def band_label_from_idx(idx: int):
+def current_band_position(rainbow_df: pd.DataFrame):
+    last = rainbow_df.iloc[-1]
+    low = last["b-2.0"]
+    high = last["b+2.0"]
+    p = last["price"]
+    if high <= low:
+        return np.nan, "N/A"
+    pos = float((p - low) / (high - low))
+    idx = int(np.clip(int(np.floor(pos * 8)) + 1, 1, 8))
     labels = {
         1: "Band 1（偏低）",
         2: "Band 2（偏低）",
@@ -258,76 +416,12 @@ def band_label_from_idx(idx: int):
         7: "Band 7（偏高）",
         8: "Band 8（极高）",
     }
-    return labels.get(idx, "N/A")
-
-def current_band_position(rainbow_df: pd.DataFrame):
-    last = rainbow_df.iloc[-1]
-    low = last["b-2.0"]
-    high = last["b+2.0"]
-    p = last["price"]
-    if high <= low:
-        return np.nan, "N/A", None
-    pos = float((p - low) / (high - low))
-    idx = band_index_from_pos(pos)
-    label = band_label_from_idx(idx) if idx else "N/A"
-    return pos, label, idx
-
-def gauge(value, title, subtitle=""):
-    fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=value,
-        number={"font": {"size": 34}},
-        title={"text": f"{title}<br><span style='font-size:12px;color:#888'>{subtitle}</span>"},
-        gauge={"axis": {"range": [0, 100]}, "bar": {"thickness": 0.3}}
-    ))
-    fig.update_layout(height=220, margin=dict(l=10, r=10, t=40, b=10))
-    return fig
-
-def kpi_card_like_ref(title, main_value, subline, p30=None, p90=None, extra_right=None):
-    """
-    Reference-like KPI card:
-    - title
-    - main value
-    - subline
-    - 30d/90d percentile bars
-    """
-    def bar(label, pct):
-        if pct is None or np.isnan(pct):
-            return ""
-        pct = float(np.clip(pct, 0, 100))
-        return f"""
-        <div style="display:flex;align-items:center;gap:8px;margin-top:8px;">
-          <div style="width:44px;font-size:11px;color:#9aa4b2;">{label}</div>
-          <div style="flex:1;background:rgba(255,255,255,0.06);border-radius:999px;height:8px;overflow:hidden;">
-            <div style="width:{pct:.1f}%;height:8px;background:rgba(255,255,255,0.35);"></div>
-          </div>
-          <div style="width:44px;text-align:right;font-size:11px;color:#9aa4b2;">{pct:.0f}%</div>
-        </div>
-        """
-
-    extra = f"<div style='font-size:11px;color:#9aa4b2;margin-top:8px;'>{extra_right}</div>" if extra_right else ""
-
-    st.markdown(
-        f"""
-        <div style="padding:14px;border:1px solid rgba(255,255,255,0.08);
-        border-radius:12px;background:rgba(255,255,255,0.02);">
-          <div style="display:flex;justify-content:space-between;align-items:flex-start;">
-            <div style="font-size:12px;color:#9aa4b2;">{title}</div>
-          </div>
-          <div style="font-size:22px;font-weight:700;margin-top:6px;">{main_value}</div>
-          <div style="font-size:12px;color:#9aa4b2;margin-top:6px;">{subline}</div>
-          {bar("30d", p30)}
-          {bar("90d", p90)}
-          {extra}
-        </div>
-        """,
-        unsafe_allow_html=True
-    )
+    return pos, labels.get(idx, "N/A")
 
 # =========================================================
 # UI
 # =========================================================
-st.title("BTC 市场分析 Dashboard（方向1：KPI还原参考图）")
+st.title("BTC 市场分析 Dashboard（含威科夫做空累计提示 + 顶部判定器）")
 
 _, right = st.columns([3, 1])
 with right:
@@ -345,11 +439,21 @@ if auto:
 days_map = {"7d": 7, "30d": 30, "90d": 90, "180d": 180, "1Y": 365}
 days = days_map[tf]
 
+# Sidebar strategy config
+with st.sidebar:
+    st.markdown("## 策略参数（可改）")
+    upper_zone_lo = st.number_input("箱体上沿加空区下限", value=70000, step=500)
+    upper_zone_hi = st.number_input("箱体上沿加空区上限", value=72000, step=500)
+    upper_level = st.number_input("箱体上沿关键位（UT判断）", value=72000, step=500)
+    lower_level = st.number_input("箱体下沿关键位（破位回踩）", value=60000, step=500)
+    retest_tol = st.slider("回踩容差（%）", min_value=0.2, max_value=2.0, value=0.6, step=0.1) / 100.0
+    ut_lookback = st.slider("UT 收回窗口（4H根数）", min_value=2, max_value=12, value=6, step=1)
+    near_top_pct = st.slider("顶部判定：接近上沿阈值（%）", min_value=0.5, max_value=5.0, value=1.5, step=0.1) / 100.0
+
 # =========================================================
 # Load data
 # =========================================================
 source_status = []
-
 try:
     spot, spot_src, _ = get_btc_spot_usd()
     source_status.append(("现价 Spot", spot_src, "OK"))
@@ -360,26 +464,19 @@ try:
     fng, fng_src, _ = get_fear_greed(limit=max(200, days + 30))
     source_status.append(("恐惧贪婪", fng_src, "OK"))
 
-    try:
-        iv_df, iv_src, _ = get_deribit_vol_index(days=max(180, days))
-        source_status.append(("期权IV指数", iv_src, "OK"))
-        iv_is_proxy = False
-    except Exception:
-        iv_df = None
-        iv_src = "Proxy: RV30"
-        source_status.append(("期权IV指数", iv_src, "FALLBACK"))
-        iv_is_proxy = True
+    # Hourly for 4H/8H
+    df_1h = get_btc_history_hourly(hours=24 * 60)
+    source_status.append(("小时线(用于4H/8H)", "CryptoCompare", "OK"))
 
 except Exception as e:
     st.error(f"数据拉取失败：{e}")
     st.stop()
 
 with st.expander("数据源状态（点开查看）", expanded=False):
-    df_status = pd.DataFrame(source_status, columns=["模块", "数据源", "状态"])
-    dataframe_show(df_status)
+    dataframe_show(pd.DataFrame(source_status, columns=["模块", "数据源", "状态"]))
 
 # =========================================================
-# Slice + metrics
+# Prepare datasets
 # =========================================================
 hist = hist.sort_values("date").reset_index(drop=True)
 hist_slice = hist[hist["date"] >= (hist["date"].max() - pd.Timedelta(days=days))].reset_index(drop=True)
@@ -387,115 +484,135 @@ hist_slice = hist[hist["date"] >= (hist["date"].max() - pd.Timedelta(days=days))
 fng = fng.sort_values("date").reset_index(drop=True)
 fng_slice = fng[fng["date"] >= (fng["date"].max() - pd.Timedelta(days=days))].reset_index(drop=True)
 
-rv30 = realized_vol(hist, 30)
-rv90 = realized_vol(hist, 90)
+df_4h = resample_ohlcv(df_1h, "4H")
+df_8h = resample_ohlcv(df_1h, "8H")
 
-# Vol (use RV90 as DVOL proxy)
+# Vol proxies
+rv90 = realized_vol(hist, 90)
 rv90_last = float(rv90.dropna().iloc[-1]["rv90"]) if rv90["rv90"].notna().any() else np.nan
-rv90_p30 = window_percentile(rv90["rv90"], rv90_last, 30)
-rv90_p90 = window_percentile(rv90["rv90"], rv90_last, 90)
+vol_pct = percentile_rank(rv90["rv90"], rv90_last)
 
 # FNG
 fng_last = float(fng_slice.iloc[-1]["value"]) if len(fng_slice) else np.nan
-fng_class = fng_slice.iloc[-1]["value_classification"] if len(fng_slice) else "N/A"
-fng_p30 = window_percentile(fng["value"], fng_last, 30)
-fng_p90 = window_percentile(fng["value"], fng_last, 90)
 
-# Rainbow band
+# Rainbow
 rainbow = build_rainbow_bands(hist)
-band_pos, band_label, band_idx = current_band_position(rainbow)
-band_text = f"Band {band_idx}/8" if band_idx else "Band N/A"
+band_pos, band_label = current_band_position(rainbow)
 
-# IV (Deribit or proxy)
-if iv_df is None:
-    iv_series = rv30.rename(columns={"rv30": "iv"}).copy().dropna().reset_index(drop=True)
-else:
-    iv_series = iv_df.copy().dropna().reset_index(drop=True)
-
-iv_slice = iv_series[iv_series["date"] >= (iv_series["date"].max() - pd.Timedelta(days=days))].reset_index(drop=True)
-iv_last = float(iv_slice.iloc[-1]["iv"]) if len(iv_slice) else np.nan
-iv_prev = float(iv_slice.iloc[-2]["iv"]) if len(iv_slice) >= 2 else np.nan
-iv_change = (iv_last - iv_prev) if (not np.isnan(iv_last) and not np.isnan(iv_prev)) else np.nan
-iv_p30 = window_percentile(iv_series["iv"], iv_last, 30)
-iv_p90 = window_percentile(iv_series["iv"], iv_last, 90)
-
-# Score
-vol_pct_for_score = percentile_rank(rv90["rv90"], rv90_last)
-score = score_from_metrics(vol_pct_for_score, fng_last, band_pos)
+# Score (optional)
+score = score_from_metrics(vol_pct, fng_last, band_pos)
 
 # =========================================================
-# KPI row (reference-like)
+# TOP KPIs (simple)
 # =========================================================
-c1, c2, c3, c4, c5 = st.columns([1.2, 1, 1, 1, 1])
+c1, c2, c3 = st.columns([1.2, 1, 1])
 
 with c1:
-    plotly_show(gauge(score, f"{int(round(score))}", "较好的状态" if score >= 60 else "偏谨慎"))
+    plotly_show(gauge(score, f"{int(round(score))}", "综合市场状态"))
     st.caption(f"BTC Spot: ${spot:,.0f}  ·  Source: {spot_src}")
 
 with c2:
-    kpi_card_like_ref(
-        "IV 百分位（DVOL）",
-        f"DVOL {rv90_last*100:.1f}%" if not np.isnan(rv90_last) else "N/A",
-        "波动率越高，风险越高",
-        p30=rv90_p30,
-        p90=rv90_p90,
-    )
-
+    st.metric("箱体上沿", f"{upper_zone_lo:,.0f} – {upper_zone_hi:,.0f}", "优先加空关注区")
 with c3:
-    kpi_card_like_ref(
-        "恐惧贪婪指数",
-        f"{int(round(fng_last))}（{fng_class}）" if not np.isnan(fng_last) else "N/A",
-        "情绪极端 = 拥挤交易",
-        p30=fng_p30,
-        p90=fng_p90,
-    )
-
-with c4:
-    kpi_card_like_ref(
-        "比特币彩虹图",
-        f"{band_label}",
-        band_text,
-        p30=(band_pos * 100 if not np.isnan(band_pos) else None),
-        p90=None,
-        extra_right="（估值带位置）"
-    )
-
-with c5:
-    arrow = "▲" if (not np.isnan(iv_change) and iv_change >= 0) else "▼"
-    title = "IV 趋势（Deribit）" if not iv_is_proxy else "IV 趋势（Proxy）"
-    kpi_card_like_ref(
-        title,
-        f"{iv_last*100:.1f}%" if not np.isnan(iv_last) else "N/A",
-        f"24h: {arrow} {iv_change*100:+.2f}%" if not np.isnan(iv_change) else "24h: N/A",
-        p30=iv_p30,
-        p90=iv_p90,
-    )
+    st.metric("箱体下沿", f"{lower_level:,.0f}", "破位回踩确认区")
 
 st.divider()
 
 # =========================================================
-# 4-panel charts (same structure)
+# Strategy Panel (Wyckoff short accumulation map)
+# =========================================================
+st.subheader("策略提示（做空累计：上沿做空 + 假突破UT + 破位回踩）")
+
+current_price = float(spot)
+
+in_upper_zone = in_range(current_price, upper_zone_lo, upper_zone_hi)
+in_mid_box = in_range(current_price, lower_level, upper_zone_lo)
+below_lower = current_price < lower_level
+
+ut_triggered, ut_info = detect_ut_fake_breakout(df_4h, upper_level, lookback_bars=int(ut_lookback))
+br_triggered, br_info = detect_break_retest_fail(df_4h, lower_level, tolerance=float(retest_tol))
+
+# NEW: Top detector (LH + bearish candlesticks near top)
+top_triggered, top_reasons = top_detector(df_4h, upper_level, near_pct=float(near_top_pct))
+
+def badge(text, ok=True):
+    color = "#2ecc71" if ok else "#f39c12"
+    st.markdown(
+        f"<span style='display:inline-block;padding:4px 10px;border-radius:999px;"
+        f"background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.10);"
+        f"color:{color};font-size:12px;margin-right:6px;margin-bottom:6px;'>{text}</span>",
+        unsafe_allow_html=True
+    )
+
+colA, colB, colC = st.columns([1.2, 1.5, 1.8])
+
+with colA:
+    st.markdown("**位置层（现在在哪）**")
+    badge(f"上沿加空区 {upper_zone_lo:,.0f}–{upper_zone_hi:,.0f}", in_upper_zone)
+    badge("箱体中部（不优先加仓）", in_mid_box)
+    badge(f"跌破下沿 < {lower_level:,.0f}（等待回踩）", below_lower)
+
+with colB:
+    st.markdown("**结构层（形态/确认）**")
+    badge(f"UT 假突破：{ut_info}", ut_triggered)
+    badge(f"破位回踩失败：{br_info}", br_triggered)
+
+    st.markdown("**顶部判定器（更贴威科夫）**")
+    badge("顶部判定器触发（LH 或 顶部K线）", top_triggered)
+    with st.expander("顶部判定器细节", expanded=False):
+        for r in top_reasons:
+            st.write(f"- {r}")
+
+with colC:
+    st.markdown("**操作层（Dashboard 提示）**")
+
+    if br_triggered:
+        st.info("✅ **确认空点：破位后回踩失败**\n\n已跌破下沿并回踩不过（结构确认转弱），按你的框架属于更“稳健”的加空类型。")
+    elif ut_triggered:
+        st.info("✅ **更优空点：UT 假突破**\n\n突破上沿后迅速收回区间，典型“诱多+供应回归”。可作为更优的加空触发。")
+    elif in_upper_zone and top_triggered:
+        st.warning("🟡 **可考虑分批加空：上沿 + 顶部判定器确认**\n\n你已经在上沿区域，同时出现 LH/顶部K线失败形态，符合“位置好 + 到顶部才加空”。")
+    elif in_upper_zone:
+        st.success("🟢 **进入加空关注区（上沿）**\n\n但还缺“顶部确认”（LH 或 失败K线 / UT）。按框架：更适合耐心等触发再动。")
+    else:
+        st.success("🟢 **当前不在理想加仓区**\n\n按你的框架更像‘等位置/等信号’，避免在箱体中段情绪化加仓。")
+
+st.caption("说明：顶部判定器使用 4H 摆动高点（LH）+ 顶部失败K线（长上影/吞没）组合；触发后会更贴近“短周期到顶部才加空”的口径。")
+
+st.divider()
+
+# =========================================================
+# Charts (optional, keep simple 4 panels)
 # =========================================================
 left1, right1 = st.columns(2)
 left2, right2 = st.columns(2)
 
 with left1:
-    st.subheader("波动率（RV90） + 价格")
+    st.subheader("价格（日线）+ 关键位")
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=hist_slice["date"], y=hist_slice["price"], name="BTC Price", yaxis="y2"))
-    rv90_s = rv90[rv90["date"] >= hist_slice["date"].min()].copy()
-    fig.add_trace(go.Scatter(x=rv90_s["date"], y=rv90_s["rv90"] * 100, name="RV90(%)"))
-    fig.update_layout(
-        height=360,
-        margin=dict(l=10, r=10, t=30, b=10),
-        yaxis=dict(title="Vol %"),
-        yaxis2=dict(title="Price USD", overlaying="y", side="right"),
-        legend=dict(orientation="h"),
-    )
+    fig.add_trace(go.Scatter(x=hist_slice["date"], y=hist_slice["price"], name="BTC Price"))
+    # key levels
+    fig.add_hline(y=float(upper_level), line_width=1, opacity=0.5)
+    fig.add_hline(y=float(lower_level), line_width=1, opacity=0.5)
+    fig.update_layout(height=360, margin=dict(l=10, r=10, t=30, b=10), yaxis=dict(title="Price USD"))
     plotly_show(fig)
 
 with right1:
-    st.subheader("恐惧贪婪（FNG） + 价格")
+    st.subheader("4H K线（近60天）")
+    d = df_4h.copy()
+    d = d.tail(300)
+    fig = go.Figure(data=[go.Candlestick(
+        x=d["date"],
+        open=d["open"], high=d["high"], low=d["low"], close=d["close"],
+        name="4H"
+    )])
+    fig.add_hline(y=float(upper_level), line_width=1, opacity=0.5)
+    fig.add_hline(y=float(lower_level), line_width=1, opacity=0.5)
+    fig.update_layout(height=360, margin=dict(l=10, r=10, t=30, b=10))
+    plotly_show(fig)
+
+with left2:
+    st.subheader("恐惧贪婪（FNG）+ 价格")
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=hist_slice["date"], y=hist_slice["price"], name="BTC Price", yaxis="y2"))
     fig.add_trace(go.Scatter(x=fng_slice["date"], y=fng_slice["value"], name="FNG"))
@@ -508,11 +625,10 @@ with right1:
     )
     plotly_show(fig)
 
-with left2:
-    st.subheader("比特币彩虹带（估值带）")
+with right2:
+    st.subheader("彩虹带（估值带）")
     rb = rainbow.copy()
     rb = rb[rb["date"] >= (rb["date"].max() - pd.Timedelta(days=365*3))].reset_index(drop=True)
-
     fig = go.Figure()
     band_keys = ["b-2.0", "b-1.5", "b-1.0", "b-0.5", "b+0.0", "b+0.5", "b+1.0", "b+1.5", "b+2.0"]
     fig.add_trace(go.Scatter(x=rb["date"], y=rb[band_keys[0]], name="Band low", line=dict(width=1), opacity=0.2))
@@ -533,18 +649,4 @@ with left2:
     )
     plotly_show(fig)
 
-with right2:
-    st.subheader(f"IV 趋势（{tf}）" + ("（Deribit）" if not iv_is_proxy else "（Proxy: RV30）"))
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=hist_slice["date"], y=hist_slice["price"], name="BTC Price", yaxis="y2"))
-    fig.add_trace(go.Scatter(x=iv_slice["date"], y=iv_slice["iv"] * 100, name="IV(%)"))
-    fig.update_layout(
-        height=360,
-        margin=dict(l=10, r=10, t=30, b=10),
-        yaxis=dict(title="IV %"),
-        yaxis2=dict(title="Price USD", overlaying="y", side="right"),
-        legend=dict(orientation="h"),
-    )
-    plotly_show(fig)
-
-st.caption("说明：方向1已完成：顶部 KPI 采用“主值 + 30d/90d 分位条 + Band X/8”格式，更贴近参考图。")
+st.caption("提示：你现在的框架=“上沿等顶部确认加空；更优=UT；确认=破位回踩失败；做多等SC/二测”。仪表盘已把这些变成可打勾的规则提示。")
